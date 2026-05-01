@@ -1,9 +1,15 @@
-# Byte-compiled / optimized / DLL files
+# ==========================
+# Python
+# ==========================
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+*.pyd
 
-# Environments
+# ==========================
+# Virtual Environment
+# ==========================
 .env
 .venv
 env/
@@ -12,13 +18,49 @@ ENV/
 env.bak/
 venv.bak/
 
-# Project specific
+# ==========================
+# Project Specific
+# ==========================
+# Captured images from recognition sessions
 captures/
-*.log
-.DS_Store
 
-# Large assets
-*.png
+# Temporary SIFT analysis file
+temp_analysis.jpg
+
+# Logs
+*.log
+
+# ==========================
+# Audio Files (large binary)
+# Keep sources, ignore generated
+# ==========================
+audio_server_project/audio_files/
+audio_server_project/__pycache__/
+
+# ==========================
+# macOS System Files
+# ==========================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ==========================
+# Images — Keep references, ignore everything else
+# ==========================
 *.jpg
+*.jpeg
+*.png
+*.bmp
 !references/*.jpg
+!references/*.jpeg
 !references/*.png
+
+# ==========================
+# IDE / Editor
+# ==========================
+.vscode/
+.idea/
+*.swp
+*.swo
+audio_server_project/

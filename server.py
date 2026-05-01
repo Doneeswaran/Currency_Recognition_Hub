@@ -5,6 +5,7 @@ import os
 import threading
 import cv2
 import numpy as np
+from collections import deque, Counter
 
 recognition_history = []
 
@@ -22,16 +23,19 @@ index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
 search_params = dict(checks=50)
 flann = cv2.FlannBasedMatcher(index_params, search_params)
 
+# Load Face Cascade for face filtering
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
 # Calibration: Hue ranges for Indian Rupee Notes (HSV)
-# Tuned for ESP32-CAM greenish tint and sensor noise
+# Re-calibrated against actual webcam captures to fix 100/200 and 10/20 confusion
 COLOR_RANGES = {
-    "10":   {"h": [10, 25],   "s": [50, 255],  "v": [50, 255]}, # Brown
-    "20":   {"h": [35, 85],   "s": [50, 255],  "v": [50, 255]}, # Greenish-Yellow
-    "50":   {"h": [95, 115],  "s": [70, 255],  "v": [70, 255]}, # Cyan/Blue
-    "100":  {"h": [100, 165], "s": [10, 255],  "v": [40, 255]}, # Lavender (Adjusted for low-light/camera noise)
-    "200":  {"h": [15, 35],   "s": [100, 255], "v": [100, 255]},# Bright Orange
-    "500":  {"h": [75, 105],  "s": [0, 45],    "v": [30, 180]}, # Stone Grey (Tightened to avoid desaturated lavender)
-    "2000": {"h": [160, 175], "s": [50, 255],  "v": [50, 255]} # Magenta
+    "10":   {"h": [8,  22],   "s": [60, 255],  "v": [40, 220]},  # Warm Brown/Chocolate
+    "20":   {"h": [38, 75],  "s": [60, 255],  "v": [60, 255]},  # Yellow-Green/Olive (non-overlapping with 10)
+    "50":   {"h": [88, 120], "s": [60, 255],  "v": [60, 255]},  # Cyan/Teal-Blue
+    "100":  {"h": [120, 160],"s": [25, 200],  "v": [60, 220]},  # Lavender/Purple (tighter, avoids grey)
+    "200":  {"h": [18, 38],  "s": [120, 255], "v": [100, 255]}, # Bright Orange/Yellow (high saturation only)
+    "500":  {"h": [75, 105], "s": [0, 45],    "v": [30, 180]},  # Stone Grey (low saturation)
+    "2000": {"h": [155, 175],"s": [50, 255],  "v": [50, 255]}   # Magenta/Pink
 }
 
 # Pre-load reference patterns
@@ -115,6 +119,17 @@ def process_currency(image_path):
     # Fix the constant 'greenish' cast from low-cost ESP32 sensors
     image_balanced = white_balance(image_raw)
     
+    # --- Phase 1.5: Face Detection ---
+    gray_for_face = cv2.cvtColor(image_balanced, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray_for_face, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+    face_detected = False
+    if len(faces) > 0:
+        for (fx, fy, fw, fh) in faces:
+            # If a face occupies a reasonable portion of the frame
+            if fw * fh > (image_raw.shape[0] * image_raw.shape[1]) * 0.05:
+                face_detected = True
+                break
+                
     # --- Phase 2: Adaptive Note Localization ---
     gray = cv2.cvtColor(image_balanced, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -167,8 +182,8 @@ def process_currency(image_path):
         max_good = 0
         for des_ref in des_list:
             matches = flann.knnMatch(des_test, des_ref, k=2)
-            # Relaxed Lowe's ratio to 0.75 for non-specimen capture noise
-            good_matches = [m_pair[0] for m_pair in matches if len(m_pair)==2 and m_pair[0].distance < 0.75 * m_pair[1].distance]
+            # Tightened Lowe's ratio to 0.70 to prevent false positive matches on faces/backgrounds
+            good_matches = [m_pair[0] for m_pair in matches if len(m_pair)==2 and m_pair[0].distance < 0.70 * m_pair[1].distance]
             max_good = max(max_good, len(good_matches))
         pattern_scores[denom] = max_good
 
@@ -200,22 +215,35 @@ def process_currency(image_path):
     pattern_confidence = max_matches / (runner_up_matches + 1)
     color_agreement = (best_denom == best_color_denom)
     
-    print(f"Decision Debug | SIFT: {best_denom}({max_matches}) | Color: {best_color_denom}({max_color_density:.2%}) | NoteShape: {is_note_shape}")
+    print(f"Decision Debug | SIFT: {best_denom}({max_matches}) vs Runner-up:{runner_up_denom}({runner_up_matches}) | Color: {best_color_denom}({max_color_density:.2%}) | NoteShape: {is_note_shape} | Face: {face_detected}")
     
-    # 1. High Certainty (Pattern match with any note)
-    if max_matches >= 35:
+    # Apply Face Filtering first
+    if face_detected and not is_note_shape and max_matches < 20:
+        print("  [Decision Logic] Override: Face detected without clear note.")
+        return "unknown", pattern_scores
+
+    # Confidence gap: best result must be meaningfully better than runner-up
+    # This prevents Gandhi's face on 100 from spuriously matching 200 reference
+    confidence_gap = max_matches - runner_up_matches
+
+    # 1. High Certainty (Strong SIFT match with clear gap over runner-up)
+    if max_matches >= 40 and confidence_gap >= 8:
         final_decision = best_denom
     
-    # 2. Medium Certainty (Pattern + Color agreement)
-    elif max_matches >= 15 and (color_agreement or max_matches > 50):
+    # 2. High Certainty relaxed (very strong absolute match)
+    elif max_matches >= 55:
+        final_decision = best_denom
+    
+    # 3. Medium Certainty (Pattern + Color + Shape all agree)
+    elif max_matches >= 20 and color_agreement and is_note_shape and confidence_gap >= 5:
         final_decision = best_denom
         
-    # 3. Shape-based Color Fallback (If pattern is weak but color and shape are strong)
-    elif max_color_density > 0.12 and is_note_shape:
+    # 4. Shape-based Color Fallback (pattern weak but color+shape strong)
+    elif max_color_density > 0.15 and is_note_shape and max_matches >= 8 and confidence_gap >= 3:
         final_decision = best_color_denom
         
-    # 4. Emergency Fallback for desaturated 100 notes
-    elif color_verification.get("100", 0) > 0.15:
+    # 5. Emergency Fallback for desaturated 100 notes only with shape+matches guard
+    elif color_verification.get("100", 0) > 0.18 and is_note_shape and max_matches >= 8:
         final_decision = "100"
             
     return final_decision, pattern_scores
@@ -225,6 +253,25 @@ latest_frame_time = 0
 current_result = "unknown"
 current_scores = {}
 analysis_lock = threading.Lock()
+
+# Temporal voting buffer: store last 7 raw results
+# A denomination only becomes 'stable' if it appears >= 4 times in 7 frames
+result_buffer = deque(maxlen=7)
+
+def get_stable_result(raw_result):
+    """Apply majority-voting to smooth out single-frame misidentifications."""
+    result_buffer.append(raw_result)
+    if len(result_buffer) < 4:
+        return "unknown"  # Not enough data yet
+    counts = Counter(result_buffer)
+    most_common, count = counts.most_common(1)[0]
+    # Require majority (4 out of 7) AND it must not be unknown
+    if count >= 4 and most_common != "unknown":
+        return most_common
+    # If unknown is the majority, return unknown
+    if counts.get("unknown", 0) >= 4:
+        return "unknown"
+    return "unknown"  # No clear majority = not confident enough
 
 def recognition_worker():
     global latest_frame, current_result, current_scores
@@ -245,24 +292,39 @@ def recognition_worker():
             # Run SIFT
             result, scores = process_currency(temp_file)
             
-            # Update global state
-            current_result = result
+            # Apply temporal voting for stability
+            stable_result = get_stable_result(result)
+            
+            # Update global state with the STABLE (voted) result
+            current_result = stable_result
             current_scores = scores
             last_processed_time = process_start_time
             
-            # Record in history only if it's a real detection
-            if result != "unknown":
+            # Record in history only if it's a stable real detection
+            if stable_result != "unknown" and stable_result != current_result:
                 hist_file = f"{UPLOAD_FOLDER}/capture_{int(time.time())}.jpg"
-                os.rename(temp_file, hist_file)
+                if os.path.exists(temp_file):
+                    os.rename(temp_file, hist_file)
                 recognition_history.insert(0, {
                     "image": hist_file.split('/')[-1],
-                    "result": result,
+                    "result": stable_result,
+                    "timestamp": time.time()
+                })
+                if len(recognition_history) > 50:
+                    recognition_history.pop()
+            elif stable_result != "unknown":
+                hist_file = f"{UPLOAD_FOLDER}/capture_{int(time.time())}.jpg"
+                if os.path.exists(temp_file):
+                    os.rename(temp_file, hist_file)
+                recognition_history.insert(0, {
+                    "image": hist_file.split('/')[-1],
+                    "result": stable_result,
                     "timestamp": time.time()
                 })
                 if len(recognition_history) > 50:
                     recognition_history.pop()
             
-            print(f"Background Analysis: {result} ({scores.get(result, 0)} matches)")
+            print(f"Raw: {result} → Stable: {stable_result} ({scores.get(stable_result, 0)} matches)")
             
         time.sleep(0.1) # Check for new frames 10 times a second
 
@@ -281,6 +343,11 @@ def gen_frames():
 def video_feed():
     from flask import Response
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/recognize', methods=['GET'])
+def recognize_get():
+    from flask import redirect
+    return redirect('/')
 
 @app.route('/recognize', methods=['POST'])
 def recognize():
