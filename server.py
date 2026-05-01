@@ -14,14 +14,9 @@ UPLOAD_FOLDER = 'captures'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# Advanced Recognition: SIFT Feature Matching (More robust than ORB)
-sift = cv2.SIFT_create(nfeatures=2000, contrastThreshold=0.04, edgeThreshold=10, sigma=1.6)
-
-# FLANN Matcher for SIFT (Faster and more accurate than Brute Force for large feature sets)
-FLANN_INDEX_KDTREE = 1
-index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-search_params = dict(checks=50)
-flann = cv2.FlannBasedMatcher(index_params, search_params)
+# Ultra-Fast Recognition: ORB Feature Matching (Optimized for Speed)
+orb = cv2.ORB_create(nfeatures=3000, scaleFactor=1.2, nlevels=8, edgeThreshold=15)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
 # Load Face Cascade for face filtering
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -63,10 +58,10 @@ def load_references():
             
             # Check if image is valid (catches the 121-byte corrupted file issue)
             if img is not None and img.size > 1000:
-                # Resolution Matching: Scale master to 800px width for SIFT detail
+                # Resolution Matching: Scale master to 500px width for ORB speed
                 h, w = img.shape
-                new_w = 800
-                new_h = int(h * (800 / w))
+                new_w = 500
+                new_h = int(h * (500 / w))
                 img_scaled = cv2.resize(img, (new_w, new_h))
                 
                 # Apply CLAHE to reference to match real-time frame enhancement
@@ -76,19 +71,11 @@ def load_references():
                 if denom not in REFERENCE_LIBRARY:
                     REFERENCE_LIBRARY[denom] = []
                 
-                # Synthetic Training: Create 3 views for each note (Original, -15 deg, +15 deg)
-                angles = [0, -15, 15]
-                for angle in angles:
-                    if angle == 0:
-                        view = img_ref_enhanced
-                    else:
-                        M = cv2.getRotationMatrix2D((new_w/2, new_h/2), angle, 1.0)
-                        view = cv2.warpAffine(img_ref_enhanced, M, (new_w, new_h))
-                    
-                    kp, des = sift.detectAndCompute(view, None)
-                    if des is not None:
-                        REFERENCE_LIBRARY[denom].append(des)
-                        processed_denoms.add(denom)
+                # Single high-quality view for maximum speed
+                kp, des = orb.detectAndCompute(img_ref_enhanced, None)
+                if des is not None:
+                    REFERENCE_LIBRARY[denom].append(des)
+                    processed_denoms.add(denom)
                 
                 print(f"  - Trained ₹{denom} with SIFT (Source: {filename})")
             else:
@@ -170,10 +157,10 @@ def process_currency(image_path):
     img_gray = cv2.cvtColor(image_roi, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     img_enhanced = clahe.apply(img_gray)
-    img_final = cv2.resize(img_enhanced, (800, 600))
+    img_final = cv2.resize(img_enhanced, (500, 375))
     
-    # --- Phase 4: SIFT Pattern Matching ---
-    kp_test, des_test = sift.detectAndCompute(img_final, None)
+    # --- Phase 4: ORB Pattern Matching ---
+    kp_test, des_test = orb.detectAndCompute(img_final, None)
     if des_test is None or len(des_test) < 10:
         return "unknown", {}
     
@@ -181,9 +168,10 @@ def process_currency(image_path):
     for denom, des_list in REFERENCE_LIBRARY.items():
         max_good = 0
         for des_ref in des_list:
-            matches = flann.knnMatch(des_test, des_ref, k=2)
-            # Tightened Lowe's ratio to 0.70 to prevent false positive matches on faces/backgrounds
-            good_matches = [m_pair[0] for m_pair in matches if len(m_pair)==2 and m_pair[0].distance < 0.70 * m_pair[1].distance]
+            # Use Brute-Force Matcher (Hamming) for ORB - much faster than FLANN
+            matches = bf.match(des_test, des_ref)
+            # Sort by distance
+            good_matches = [m for m in matches if m.distance < 45]
             max_good = max(max_good, len(good_matches))
         pattern_scores[denom] = max_good
 
@@ -199,51 +187,42 @@ def process_currency(image_path):
     # --- Phase 6: Decision Fusion Logic ---
     final_decision = "unknown"
     sorted_patterns = sorted(pattern_scores.items(), key=lambda x: x[1], reverse=True)
+    # --- Phase 6: Decision Fusion Logic ---
+    final_decision = "unknown"
+    sorted_patterns = sorted(pattern_scores.items(), key=lambda x: x[1], reverse=True)
     best_denom, max_matches = sorted_patterns[0]
     runner_up_denom, runner_up_matches = sorted_patterns[1] if len(sorted_patterns) > 1 else ("none", 0)
+    confidence_gap = max_matches - runner_up_matches
     
     sorted_colors = sorted(color_verification.items(), key=lambda x: x[1], reverse=True)
     best_color_denom, max_color_density = sorted_colors[0]
-    
-    # Logic Correction: If SIFT thinks it's 500 but color density for 100 is higher, 
-    # it's likely a desaturated 100 note (lavender looks grey).
-    if best_denom == "500" and color_verification.get("100", 0) > max_color_density * 0.8:
-        if color_verification.get("100", 0) > 0.05:
-            best_denom = "100"
-            print("  [Decision Logic] Re-routing 500 -> 100 based on color evidence")
-
-    pattern_confidence = max_matches / (runner_up_matches + 1)
     color_agreement = (best_denom == best_color_denom)
     
-    print(f"Decision Debug | SIFT: {best_denom}({max_matches}) vs Runner-up:{runner_up_denom}({runner_up_matches}) | Color: {best_color_denom}({max_color_density:.2%}) | NoteShape: {is_note_shape} | Face: {face_detected}")
+    print(f"Decision Debug | ORB: {best_denom}({max_matches}) vs Runner-up:{runner_up_denom}({runner_up_matches}) | Color: {best_color_denom}({max_color_density:.2%}) | NoteShape: {is_note_shape}")
     
-    # Apply Face Filtering first
-    if face_detected and not is_note_shape and max_matches < 20:
-        print("  [Decision Logic] Override: Face detected without clear note.")
+    # Apply Face Filtering - only block if matches are VERY low
+    if face_detected and not is_note_shape and max_matches < 30:
+        print("  [Decision Logic] Override: Face detected without clear note evidence.")
         return "unknown", pattern_scores
 
-    # Confidence gap: best result must be meaningfully better than runner-up
-    # This prevents Gandhi's face on 100 from spuriously matching 200 reference
-    confidence_gap = max_matches - runner_up_matches
-
-    # 1. High Certainty (Strong SIFT match with clear gap over runner-up)
-    if max_matches >= 40 and confidence_gap >= 8:
+    # 1. High Certainty (Strong ORB match)
+    if max_matches >= 80 and confidence_gap >= 25:
         final_decision = best_denom
     
-    # 2. High Certainty relaxed (very strong absolute match)
-    elif max_matches >= 55:
+    # 2. Strong ORB match (very high absolute)
+    elif max_matches >= 120:
         final_decision = best_denom
     
-    # 3. Medium Certainty (Pattern + Color + Shape all agree)
-    elif max_matches >= 20 and color_agreement and is_note_shape and confidence_gap >= 5:
+    # 3. Medium Certainty (Pattern + Color agree)
+    elif max_matches >= 40 and color_agreement and (is_note_shape or confidence_gap >= 20):
         final_decision = best_denom
         
-    # 4. Shape-based Color Fallback (pattern weak but color+shape strong)
-    elif max_color_density > 0.15 and is_note_shape and max_matches >= 8 and confidence_gap >= 3:
+    # 4. Color-based Fallback (pattern weak but color VERY strong)
+    elif max_color_density > 0.35 and (is_note_shape or max_matches >= 25):
         final_decision = best_color_denom
         
-    # 5. Emergency Fallback for desaturated 100 notes only with shape+matches guard
-    elif color_verification.get("100", 0) > 0.18 and is_note_shape and max_matches >= 8:
+    # 5. Specific guard for ₹100 lavender (often detected as 500-grey)
+    elif color_verification.get("100", 0) > 0.15 and max_matches >= 10:
         final_decision = "100"
             
     return final_decision, pattern_scores
@@ -527,34 +506,14 @@ def camera_tester():
             .btn:disabled { background: #444; cursor: not-allowed; }
             .btn-live { background: #d32f2f; }
             .btn-live.active { background: #388e3c; box-shadow: 0 0 10px rgba(56, 142, 60, 0.5); }
-            
-            .scanning-indicator {
-                display: none;
-                align-items: center;
-                justify-content: center;
-                margin-top: 10px;
-                color: #4CAF50;
-                font-weight: bold;
-                font-size: 14px;
-            }
-            .scanning-indicator .dot {
-                height: 10px;
-                width: 10px;
-                background-color: #4CAF50;
-                border-radius: 50%;
-                display: inline-block;
-                margin-right: 8px;
-                animation: pulse 1s infinite;
-            }
-            @keyframes pulse {
-                0% { transform: scale(0.8); opacity: 0.5; }
-                50% { transform: scale(1.2); opacity: 1; }
-                100% { transform: scale(0.8); opacity: 0.5; }
-            }
+            .scanning-indicator { display: none; align-items: center; justify-content: center; margin-top: 10px; color: #4CAF50; font-weight: bold; font-size: 14px; }
+            .scanning-indicator .dot { height: 10px; width: 10px; background-color: #4CAF50; border-radius: 50%; display: inline-block; margin-right: 8px; animation: pulse 1s infinite; }
+            @keyframes pulse { 0% { transform: scale(0.8); opacity: 0.5; } 50% { transform: scale(1.2); opacity: 1; } 100% { transform: scale(0.8); opacity: 0.5; } }
             #result-container { margin-top: 20px; padding: 15px; border-radius: 8px; display: none; }
             .result-text { font-size: 28px; font-weight: bold; color: #bb86fc; }
             .nav-link { margin-top: 20px; display: block; color: #03dac6; text-decoration: none; }
             .nav-link:hover { text-decoration: underline; }
+            #debug-log { margin-bottom: 20px; padding: 10px; background: #000; color: #0f0; font-family: monospace; font-size: 11px; text-align: left; height: 100px; overflow-y: auto; border: 1px solid #333; border-radius: 5px; }
             canvas { display: none; }
         </style>
     </head>
@@ -564,24 +523,18 @@ def camera_tester():
             <div id="setup-message" style="margin-bottom: 20px; padding: 15px; background: #333; border-radius: 8px;">
                 <p>Click the button below to start your camera.</p>
             </div>
-            <div id="debug-log" style="margin-bottom: 20px; padding: 10px; background: #000; color: #0f0; font-family: monospace; font-size: 12px; text-align: left; height: 100px; overflow-y: auto; border: 1px solid #333; border-radius: 5px;">
-                > Ready. Click "Start Camera"...
-            </div>
+            <div id="debug-log">> Ready. Click "Start Camera"...</div>
             <div style="margin-bottom: 20px;">
-                <button id="start-btn" class="btn" onclick="initWebcam()">Start Camera</button>
-                <button id="recognize-btn" class="btn" style="display: none;" onclick="captureAndRecognize()">Recognize Currency</button>
-                <button id="live-toggle-btn" class="btn btn-live" style="display: none;" onclick="toggleLiveScan()">Enable Live Scan</button>
+                <button id="start-btn" onclick="initWebcam()">Start Camera</button>
+                <button id="recognize-btn" style="display: none;" onclick="captureAndRecognize()">Recognize Currency</button>
+                <button id="live-toggle-btn" class="btn-live" style="display: none;" onclick="toggleLiveScan()">Enable Live Scan</button>
             </div>
-            
-            <div id="scanning-status" class="scanning-indicator">
-                <span class="dot"></span> Scanning Currency...
-            </div>
+            <div id="scanning-status" class="scanning-indicator"><span class="dot"></span> Scanning Currency...</div>
             <video id="webcam" autoplay playsinline style="display: none;"></video>
             <div id="result-container">
                 <div>Detected Denomination:</div>
                 <div class="result-text" id="result-val">---</div>
                 <div id="score-details" style="margin-top: 15px; font-size: 14px; text-align: left; background: #2a2a2a; padding: 10px; border-radius: 5px; display: none;"></div>
-                <div style="font-size: 11px; color: #888; margin-top: 10px;">Scoring based on unique pattern matches.</div>
             </div>
             <a href="/" class="nav-link">← Back to Dashboard</a>
         </div>
@@ -597,57 +550,60 @@ def camera_tester():
             const resultVal = document.getElementById('result-val');
             const scoreDetails = document.getElementById('score-details');
             const debugLog = document.getElementById('debug-log');
-
-            let isScanning = false;
-            let scanInterval = null;
-            let isProcessing = false;
+            let isScanning = false, scanInterval = null, isProcessing = false;
 
             function log(msg) {
                 const entry = document.createElement('div');
-                entry.textContent = `> ${msg}`;
+                entry.textContent = '> ' + msg;
                 debugLog.appendChild(entry);
                 debugLog.scrollTop = debugLog.scrollHeight;
                 console.log(msg);
             }
 
             async function initWebcam() {
-                log("Requesting camera access...");
+                log('Initializing...');
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    log('Error: Camera API missing.');
+                    alert('Camera Access Blocked.\\n\\nPlease check your Chrome flags or use localhost.');
+                    return;
+                }
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ 
-                        video: { facingMode: "environment", width: 640, height: 480 } 
+                        video: { facingMode: 'user', width: 640, height: 480 } 
                     });
                     video.srcObject = stream;
-                    video.style.display = 'block';
-                    startBtn.style.display = 'none';
-                    recognizeBtn.style.display = 'inline-block';
-                    document.getElementById('live-toggle-btn').style.display = 'inline-block';
-                    setupMsg.style.display = 'none';
-                    log("Camera started successfully.");
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        video.style.display = 'block';
+                        startBtn.style.display = 'none';
+                        recognizeBtn.style.display = 'inline-block';
+                        document.getElementById('live-toggle-btn').style.display = 'inline-block';
+                        setupMsg.style.display = 'none';
+                        log('Camera ready.');
+                    };
                 } catch (err) {
-                    log(`FAILURE: ${err.name} - ${err.message}`);
-                    alert("Camera Error: " + err.message);
+                    log('Error: ' + err.message);
+                    alert('Camera Error: ' + err.message);
                 }
             }
 
             function toggleLiveScan() {
                 const btn = document.getElementById('live-toggle-btn');
                 const status = document.getElementById('scanning-status');
-                
                 isScanning = !isScanning;
-                
                 if (isScanning) {
-                    btn.textContent = "Disable Live Scan";
+                    btn.textContent = 'Disable Live Scan';
                     btn.classList.add('active');
                     status.style.display = 'flex';
                     recognizeBtn.disabled = true;
-                    log("Live Scan enabled.");
+                    log('Live Scan Enabled.');
                     scanInterval = setInterval(captureAndRecognize, 1500);
                 } else {
-                    btn.textContent = "Enable Live Scan";
+                    btn.textContent = 'Enable Live Scan';
                     btn.classList.remove('active');
                     status.style.display = 'none';
                     recognizeBtn.disabled = false;
-                    log("Live Scan disabled.");
+                    log('Live Scan Disabled.');
                     if (scanInterval) clearInterval(scanInterval);
                 }
             }
@@ -655,53 +611,38 @@ def camera_tester():
             async function captureAndRecognize() {
                 if (isProcessing) return;
                 isProcessing = true;
-                
                 try {
                     canvas.width = video.videoWidth;
                     canvas.height = video.videoHeight;
                     canvas.getContext('2d').drawImage(video, 0, 0);
-                    
                     canvas.toBlob(blob => {
-                        log("Capturing frame...");
+                        log('Capturing frame...');
                         fetch('/recognize', {
                             method: 'POST',
                             body: blob,
-                            headers: { 
-                                'Content-Type': 'image/jpeg',
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'Accept': 'application/json'
-                            }
+                            headers: { 'Content-Type': 'image/jpeg', 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
                         })
                         .then(res => res.json())
                         .then(data => {
                             resultContainer.style.display = 'block';
-                            if(data.result === 'unknown') {
+                            if (data.result === 'unknown') {
                                 resultVal.innerText = 'Searching...';
                                 resultVal.style.color = '#888';
                             } else {
                                 resultVal.innerText = '₹' + data.result;
                                 resultVal.style.color = '#03dac6';
-                                log(`DETECTED: ₹${data.result}`);
+                                log('DETECTED: ₹' + data.result);
                             }
-                            
-                            let scoresHtml = '<strong>Pattern Match Breakdown:</strong><br>';
-                            const sortedScores = Object.entries(data.scores).sort((a,b) => b[1] - a[1]);
-                            sortedScores.forEach(([denom, score]) => {
-                                scoresHtml += `₹${denom}: ${score} matches<br>`;
-                            });
-                            scoreDetails.innerHTML = scoresHtml;
-                            scoreDetails.style.display = 'block';
                             isProcessing = false;
                         })
-                        .catch(err => {
-                            log("Communication Error!");
-                            resultVal.textContent = "Error";
-                            isProcessing = false;
+                        .catch(() => { 
+                            log('Network error.');
+                            isProcessing = false; 
                         });
                     }, 'image/jpeg');
-                } catch (err) {
-                    log(`Process Error: ${err.message}`);
-                    isProcessing = false;
+                } catch (err) { 
+                    log('Process error: ' + err.message);
+                    isProcessing = false; 
                 }
             }
         </script>

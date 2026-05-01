@@ -82,7 +82,7 @@ void audioTask(void* parameter) {
           int len = stream->readBytes(buffer, sizeof(buffer));
           if (len > 0) {
             size_t written;
-            i2s_write(I2S_NUM_0, buffer, len, &written, portMAX_DELAY);
+            i2s_write(I2S_NUM_1, buffer, len, &written, portMAX_DELAY);
           } else {
             break;
           }
@@ -139,9 +139,9 @@ void setup() {
     .data_in_num  = I2S_PIN_NO_CHANGE
   };
 
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &i2s_pins);
-  Serial.println("I2S Speaker Ready.");
+  i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &i2s_pins);
+  Serial.println("I2S Speaker Ready (I2S_NUM_1).");
 
   // --- Initialize Camera ---
   camera_config_t cam_config;
